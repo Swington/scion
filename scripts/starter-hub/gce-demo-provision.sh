@@ -45,7 +45,18 @@ function delete_resources() {
         echo "Service account ${SERVICE_ACCOUNT_EMAIL} not found."
     fi
 
-    if gcloud compute firewall-rules describe "${FIREWALL_RULE}" &>/dev/null; then
+    # In LB mode the public HTTP/HTTPS rule is replaced by the GCLB + IAP-SSH
+    # rules; delete whichever set this deployment created.
+    if [[ "${ENABLE_LB}" == "true" ]]; then
+        for fw in "scion-${HUB_NAME}-allow-gclb" "scion-${HUB_NAME}-allow-iap-ssh"; do
+            if gcloud compute firewall-rules describe "${fw}" &>/dev/null; then
+                echo "Deleting firewall rule ${fw}..."
+                gcloud compute firewall-rules delete "${fw}" --quiet
+            else
+                echo "Firewall rule ${fw} not found."
+            fi
+        done
+    elif gcloud compute firewall-rules describe "${FIREWALL_RULE}" &>/dev/null; then
         echo "Deleting firewall rule ${FIREWALL_RULE}..."
         gcloud compute firewall-rules delete "${FIREWALL_RULE}" --quiet
     else
@@ -194,8 +205,41 @@ if [[ "${ENABLE_GKE}" == "true" ]]; then
         --role "roles/container.admin" > /dev/null
 fi
 
-# Create Firewall Rule if it doesn't exist
-if ! gcloud compute firewall-rules describe "${FIREWALL_RULE}" &>/dev/null; then
+# Create Firewall Rules.
+# In LB mode the VM is private and fronted by a global external HTTPS load
+# balancer, so it needs (a) ingress from the GCLB health-check/proxy ranges to
+# the hub port and (b) IAP-tunnelled SSH (there is no public IP). Otherwise fall
+# back to the stock public HTTP/HTTPS rule.
+if [[ "${ENABLE_LB}" == "true" ]]; then
+    GCLB_RULE="scion-${HUB_NAME}-allow-gclb"
+    IAP_RULE="scion-${HUB_NAME}-allow-iap-ssh"
+    if ! gcloud compute firewall-rules describe "${GCLB_RULE}" &>/dev/null; then
+        echo "Creating firewall rule ${GCLB_RULE} (GCLB health checks + traffic)..."
+        gcloud compute firewall-rules create "${GCLB_RULE}" \
+            --network="${NETWORK}" \
+            --direction=INGRESS \
+            --action=ALLOW \
+            --rules="tcp:443,tcp:${HUB_PORT}" \
+            --source-ranges="130.211.0.0/22,35.191.0.0/16" \
+            --target-tags="scion-hub" \
+            --description="Allow Google Cloud LB health checks and traffic for Scion Hub (${HUB_NAME})"
+    else
+        echo "Firewall rule ${GCLB_RULE} already exists."
+    fi
+    if ! gcloud compute firewall-rules describe "${IAP_RULE}" &>/dev/null; then
+        echo "Creating firewall rule ${IAP_RULE} (IAP-tunnelled SSH)..."
+        gcloud compute firewall-rules create "${IAP_RULE}" \
+            --network="${NETWORK}" \
+            --direction=INGRESS \
+            --action=ALLOW \
+            --rules="tcp:22" \
+            --source-ranges="35.235.240.0/20" \
+            --target-tags="scion-hub" \
+            --description="Allow IAP-tunnelled SSH for Scion Hub (${HUB_NAME})"
+    else
+        echo "Firewall rule ${IAP_RULE} already exists."
+    fi
+elif ! gcloud compute firewall-rules describe "${FIREWALL_RULE}" &>/dev/null; then
     echo "Creating firewall rule ${FIREWALL_RULE}..."
     gcloud compute firewall-rules create "${FIREWALL_RULE}" \
         --allow=tcp:80,tcp:443 \
@@ -208,17 +252,33 @@ fi
 # Create Instance
 if [[ "${INSTANCE_EXISTS}" == "false" ]]; then
     echo "Creating GCE instance ${INSTANCE_NAME}..."
+    # Build the network interface: place the VM on the configured network/subnet
+    # and, when VM_EXTERNAL_IP=false, give it no public IP (egress via Cloud NAT).
+    NIC_SPEC="network=${NETWORK},subnet=${SUBNET}"
+    if [[ "${VM_EXTERNAL_IP}" == "true" ]]; then
+        NIC_SPEC="network-tier=PREMIUM,${NIC_SPEC}"
+    else
+        NIC_SPEC="${NIC_SPEC},no-address"
+    fi
+    # Shielded VM (Secure Boot + vTPM + integrity monitoring). Required by org
+    # policies such as constraints/compute.requireShieldedVm. Left empty
+    # by default so stock deployments keep the platform default.
+    SHIELDED_FLAGS=()
+    if [[ "${SHIELDED_VM}" == "true" ]]; then
+        SHIELDED_FLAGS=(--shielded-secure-boot --shielded-vtpm --shielded-integrity-monitoring)
+    fi
     gcloud compute instances create "${INSTANCE_NAME}" \
         --project="${PROJECT_ID}" \
         --zone="${ZONE}" \
         --machine-type="${MACHINE_TYPE}" \
-        --network-interface=network-tier=PREMIUM,subnet=default \
+        --network-interface="${NIC_SPEC}" \
         --maintenance-policy=MIGRATE \
         --provisioning-model=STANDARD \
         --service-account="${SERVICE_ACCOUNT_EMAIL}" \
         --scopes=https://www.googleapis.com/auth/cloud-platform \
         --tags=https-server,scion-hub \
         --labels="env=${HUB_NAME},project=scion,type=scion-hub" \
+        "${SHIELDED_FLAGS[@]}" \
         --create-disk="auto-delete=yes,boot=yes,device-name=${INSTANCE_NAME},image=projects/ubuntu-os-cloud/global/images/family/ubuntu-2204-lts,mode=rw,size=200,type=projects/${PROJECT_ID}/zones/${ZONE}/diskTypes/pd-balanced" \
         --metadata-from-file="user-data=${CLOUD_INIT_FILE}"
 else

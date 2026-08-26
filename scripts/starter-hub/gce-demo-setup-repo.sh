@@ -31,9 +31,11 @@ fi
 wait_for_cloud_init
 
 echo "=== Ensuring scion user exists on VM ==="
+# shellcheck disable=SC2086 # SSH_TUNNEL_FLAG is intentionally word-split (flag or empty)
 gcloud compute ssh "${INSTANCE_NAME}" \
     --project="${PROJECT_ID}" \
     --zone="${ZONE}" \
+    ${SSH_TUNNEL_FLAG} \
     --command "
         if ! id scion &>/dev/null; then
             sudo useradd -m -s /bin/bash scion
@@ -50,9 +52,11 @@ gcloud compute ssh "${INSTANCE_NAME}" \
     "
 
 echo "=== Cloning Repo on GCE Instance ==="
+# shellcheck disable=SC2086 # SSH_TUNNEL_FLAG is intentionally word-split (flag or empty)
 gcloud compute ssh "${INSTANCE_NAME}" \
     --project="${PROJECT_ID}" \
     --zone="${ZONE}" \
+    ${SSH_TUNNEL_FLAG} \
     --command "
         set -euo pipefail
 

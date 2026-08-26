@@ -16,12 +16,21 @@
 # scripts/starter-hub/gce-demo-telemetry-sa.sh - Create GCP service account for agent telemetry export
 #
 # Creates a dedicated, least-privilege service account for writing telemetry
-# data (traces, logs, metrics) to Google Cloud Observability. A JSON key is
-# downloaded locally for injection into agent containers via the Hub secrets
-# system.
+# data (traces, logs, metrics) to Google Cloud Observability. By default a JSON
+# key is downloaded locally for injection into agent containers via the Hub
+# secrets system.
+#
+# KEYLESS MODE: some organizations enforce
+# constraints/iam.disableServiceAccountKeyCreation, which forbids downloading SA
+# keys. Set TELEMETRY_KEYLESS=true to create the SA and
+# grant roles WITHOUT a key; the SA is then consumed via Application Default
+# Credentials (attach it to the VM / bind via Workload Identity) instead of a
+# key file. The script ALSO auto-detects this policy: if key creation is denied
+# by it, the script degrades to keyless behavior instead of failing.
 #
 # Usage:
 #   ./scripts/starter-hub/gce-demo-telemetry-sa.sh          # Create SA, grant roles, download key
+#   TELEMETRY_KEYLESS=true ./scripts/starter-hub/gce-demo-telemetry-sa.sh   # SA + roles only (no key)
 #   ./scripts/starter-hub/gce-demo-telemetry-sa.sh delete    # Remove SA and local key file
 #
 # The key file is written to .scratch/telemetry-gcp-credentials.json
@@ -37,6 +46,10 @@ source "${SCRIPT_DIR}/hub-config.sh"
 SA_NAME="scion-telemetry-writer"
 KEY_DIR=".scratch"
 KEY_FILE="${KEY_DIR}/telemetry-gcp-credentials.json"
+
+# Keyless mode: create the SA and grant roles but do NOT download a JSON key.
+# Required under org policies enforcing constraints/iam.disableServiceAccountKeyCreation.
+TELEMETRY_KEYLESS="${TELEMETRY_KEYLESS:-false}"
 
 if [[ -z "$PROJECT_ID" ]]; then
     echo "Error: PROJECT_ID is not set and could not be determined from gcloud config."
@@ -127,35 +140,78 @@ for role in "${ROLES[@]}"; do
         --role "${role}" > /dev/null
 done
 
-# Create and download key
+# Print how to consume the SA without a downloaded key (Application Default
+# Credentials via an attached VM SA or Workload Identity).
+print_keyless_guidance() {
+    cat <<GUIDANCE
+
+=== Keyless mode (no JSON key) ===
+No service-account key was downloaded. Use Application Default Credentials (ADC)
+to consume ${SA_EMAIL} instead of a key file:
+  - GCE/VM: run the agent workload on a VM whose attached service account is
+    ${SA_EMAIL} (or grant the telemetry roles above to the VM's runtime SA).
+  - GKE:    bind ${SA_EMAIL} to the workload's KSA via Workload Identity.
+Then set SCION_GCP_PROJECT_ID=${PROJECT_ID} so the exporter resolves the project
+(ADC alone does not supply the project id).
+GUIDANCE
+}
+
+# Create and download key (unless keyless, already present, or forbidden by policy)
 mkdir -p "${KEY_DIR}"
 
-if [[ -f "${KEY_FILE}" ]]; then
+if [[ "${TELEMETRY_KEYLESS}" == "true" ]]; then
+    echo ""
+    echo "TELEMETRY_KEYLESS=true — skipping key creation (service account + roles only)."
+    print_keyless_guidance
+elif [[ -f "${KEY_FILE}" ]]; then
     echo ""
     echo "Key file ${KEY_FILE} already exists."
     echo "To regenerate, delete it first and re-run this script."
 else
     echo ""
     echo "Creating and downloading service account key..."
-    gcloud iam service-accounts keys create "${KEY_FILE}" \
-        --iam-account "${SA_EMAIL}"
-    chmod 600 "${KEY_FILE}"
-    echo "Key saved to ${KEY_FILE} (mode 0600)"
+    KEY_ERR="$(mktemp)"
+    if gcloud iam service-accounts keys create "${KEY_FILE}" \
+        --iam-account "${SA_EMAIL}" 2>"${KEY_ERR}"; then
+        chmod 600 "${KEY_FILE}"
+        echo "Key saved to ${KEY_FILE} (mode 0600)"
+        rm -f "${KEY_ERR}"
+    elif grep -qiE 'disableServiceAccountKeyCreation|key creation is not allowed' "${KEY_ERR}"; then
+        # Org policy forbids SA keys — degrade gracefully to keyless instead of failing.
+        echo "  -> Service-account key creation is blocked by an organization policy" >&2
+        echo "     (constraints/iam.disableServiceAccountKeyCreation). Falling back to keyless." >&2
+        rm -f "${KEY_FILE}" "${KEY_ERR}"   # remove any partial/empty file
+        print_keyless_guidance
+    else
+        # Any other failure is a real error — surface it and stop.
+        echo "Error: failed to create service account key:" >&2
+        cat "${KEY_ERR}" >&2
+        rm -f "${KEY_ERR}"
+        exit 1
+    fi
 fi
 
 echo ""
 echo "=== Success ==="
 echo ""
-echo "Next steps:"
-echo "  1. Upload the key to the Hub as a file-type secret:"
-echo ""
-echo "     scion hub secret set scion-telemetry-gcp-credentials \\"
-echo "       @${KEY_FILE} \\"
-echo "       --hub '<HUB_ENDPOINT_URL>' \\"
-echo "       --scope hub \\"
-echo "       --type file \\"
-echo "       --target '~/.scion/telemetry-gcp-credentials.json'"
-echo ""
-echo "  2. Ensure grove settings include 'provider: gcp' under telemetry.cloud"
+if [[ -f "${KEY_FILE}" ]]; then
+    echo "Next steps:"
+    echo "  1. Upload the key to the Hub as a file-type secret:"
+    echo ""
+    echo "     scion hub secret set scion-telemetry-gcp-credentials \\"
+    echo "       @${KEY_FILE} \\"
+    echo "       --hub '<HUB_ENDPOINT_URL>' \\"
+    echo "       --scope hub \\"
+    echo "       --type file \\"
+    echo "       --target '~/.scion/telemetry-gcp-credentials.json'"
+    echo ""
+    echo "  2. Ensure grove settings include 'provider: gcp' under telemetry.cloud"
+else
+    echo "Next steps (keyless):"
+    echo "  1. Attach ${SA_EMAIL} to the agent runtime (VM attached SA or GKE"
+    echo "     Workload Identity) so telemetry export uses ADC — see guidance above."
+    echo "  2. Ensure grove settings include 'provider: gcp' under telemetry.cloud,"
+    echo "     and set SCION_GCP_PROJECT_ID=${PROJECT_ID}."
+fi
 echo ""
 echo "  To delete this SA, run: $0 delete"

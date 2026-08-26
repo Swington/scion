@@ -66,7 +66,153 @@ GITHUB_REPO="${GITHUB_REPO:-GoogleCloudPlatform/scion}"
 CERT_EMAIL="${CERT_EMAIL:-ptone@google.com}"
 CLOUD_INIT_FILE="${CLOUD_INIT_FILE:-scripts/starter-hub/gce-demo-cloud-init.yaml}"
 
+# --- Hub Admins ---
+# Comma-separated list of Google account emails granted the hub "admin" role.
+# determineUserRole() reconciles these to "admin" on every OAuth login (additive,
+# never demoting), so the admin console (telemetry, maintenance, user management)
+# is visible to them. Emitted into settings.yaml as server.hub.admin_emails by
+# emit_settings_yaml (below). Empty by default (stock: no admins pre-seeded); a
+# deployment overlay such as the private-LB preset sets it to its own admin(s).
+HUB_ADMIN_EMAILS="${HUB_ADMIN_EMAILS:-}"
+
+# SKIP_PUSH=true skips the local "git push origin" step in gce-start-hub.sh. The
+# VM pulls the repo directly in its remote build session, so the local push is
+# only useful when you are iterating on hub source in this checkout and want the
+# VM to build your unpushed changes. Deployments whose origin is a read-only
+# upstream (e.g. a deployment overlay tracking GoogleCloudPlatform/scion) should
+# set this true. Defaults to false (stock behavior: push before the VM pulls).
+SKIP_PUSH="${SKIP_PUSH:-false}"
+
+# --- Advanced: Custom VPC, Private VM & External HTTPS Load Balancer ---
+#
+# These opt-in variables let a deployment run the hub on a custom VPC with a
+# PRIVATE VM (no public IP, egress via Cloud NAT) fronted by a Google Cloud
+# global external HTTPS load balancer that terminates client TLS with a
+# Google-managed certificate and re-encrypts to Caddy on the VM — instead of the
+# default public VM where Caddy alone terminates Let's Encrypt TLS.
+#
+# Every variable defaults to the original stock behavior, so existing public
+# single-node deployments are completely unaffected when they are left unset.
+# The private-LB overlay (scripts/starter-hub/private-lb/) sets these to reproduce
+# this hardened topology; see that directory's README.md for the full mapping.
+
+# Network placement. Defaults reproduce the stock "default network" behavior.
+NETWORK="${NETWORK:-default}"
+SUBNET="${SUBNET:-default}"
+SUBNET_RANGE="${SUBNET_RANGE:-10.0.0.0/20}"
+
+# VM_EXTERNAL_IP=false provisions the VM with no external IP (private VM).
+# Requires Cloud NAT on the network for outbound access (see private-lb/network.sh).
+VM_EXTERNAL_IP="${VM_EXTERNAL_IP:-true}"
+ROUTER_NAME="${ROUTER_NAME:-scion-${HUB_NAME}-router}"
+NAT_NAME="${NAT_NAME:-scion-${HUB_NAME}-nat}"
+
+# SHIELDED_VM=true creates the VM as a Shielded VM (Secure Boot + vTPM +
+# integrity monitoring). Some organization policies require this — they enforce
+# constraints/compute.requireShieldedVm, which rejects a plain
+# `instances create`. Defaults to false (stock behavior: no shielded flags, so
+# the image/platform default applies).
+SHIELDED_VM="${SHIELDED_VM:-false}"
+
+# Extra flags appended to every `gcloud compute ssh`/`scp` call. A private VM
+# (no external IP) is reachable only via IAP tunnelling, so set this to
+# "--tunnel-through-iap". Empty by default (public VM, direct SSH).
+SSH_TUNNEL_FLAG="${SSH_TUNNEL_FLAG:-}"
+
+# ENABLE_LB=true fronts the hub with a global external HTTPS load balancer.
+# When set: DNS points at the LB static IP (not the VM) and clients terminate TLS
+# at the LB against a Google-managed certificate. The LB then RE-ENCRYPTS to the
+# VM, connecting to Caddy (which serves its Let's Encrypt cert and reverse-proxies
+# to the hub) over LB_BACKEND_PROTOCOL:LB_BACKEND_PORT ("double TLS"). The LB
+# health check targets the hub's plain-HTTP port (LB_HC_PORT) directly, so it does
+# not depend on Caddy's host-based routing.
+ENABLE_LB="${ENABLE_LB:-false}"
+HUB_PORT="${HUB_PORT:-8080}"
+LB_BACKEND_PROTOCOL="${LB_BACKEND_PROTOCOL:-HTTPS}"
+LB_BACKEND_PORT="${LB_BACKEND_PORT:-443}"
+LB_HC_PORT="${LB_HC_PORT:-${HUB_PORT}}"
+LB_IP_NAME="${LB_IP_NAME:-scion-${HUB_NAME}-lb-ip}"
+LB_IG_NAME="${LB_IG_NAME:-scion-${HUB_NAME}-ig}"
+LB_HC_NAME="${LB_HC_NAME:-scion-${HUB_NAME}-lb-http-hc}"
+LB_BACKEND_NAME="${LB_BACKEND_NAME:-scion-${HUB_NAME}-backend}"
+LB_URLMAP_NAME="${LB_URLMAP_NAME:-scion-${HUB_NAME}-urlmap}"
+LB_CERT_NAME="${LB_CERT_NAME:-scion-${HUB_NAME}-sslcert}"
+LB_PROXY_NAME="${LB_PROXY_NAME:-scion-${HUB_NAME}-target-proxy}"
+LB_FORWARDING_RULE_NAME="${LB_FORWARDING_RULE_NAME:-scion-${HUB_NAME}-forwarding-rule}"
+
 # --- Shared Helpers ---
+
+# emit_settings_yaml — print the hub's settings.yaml (schema v1) to stdout.
+#
+# Kept as a pure, side-effect-free function (reads only the environment, writes
+# only stdout) so it can be unit-tested in isolation — see
+# starter-hub-config-test.sh. gce-start-hub.sh redirects it into the file it
+# uploads to the VM.
+#
+# Two blocks are emitted CONDITIONALLY; when their inputs are empty the output is
+# byte-identical to the original stock settings.yaml, so existing deployments are
+# unaffected:
+#   - server.hub.admin_emails   — only when HUB_ADMIN_EMAILS is non-empty. The
+#       comma-separated list becomes a YAML sequence (entries trimmed). Without
+#       it no user is reconciled to "admin" and the admin console stays hidden.
+#   - telemetry.cloud.gcp_project_id — only when PROJECT_ID is non-empty. Without
+#       it the hub cannot initialize the metrics dashboard (503
+#       metrics_unavailable) and cloud trace/log export has no project to target.
+#
+# Inputs (environment): ENABLE_GKE, HUB_ADMIN_EMAILS, PROJECT_ID.
+emit_settings_yaml() {
+    local default_runtime="docker"
+    [[ "${ENABLE_GKE:-}" == "true" ]] && default_runtime="kubernetes"
+
+    # server.hub.admin_emails block (empty string when no admins configured).
+    local admin_block=""
+    if [[ -n "${HUB_ADMIN_EMAILS:-}" ]]; then
+        admin_block=$'  hub:\n    admin_emails:\n'
+        local _email _rest="${HUB_ADMIN_EMAILS}"
+        local IFS=','
+        for _email in ${_rest}; do
+            # Trim leading/trailing whitespace around each comma-separated entry.
+            _email="${_email#"${_email%%[![:space:]]*}"}"
+            _email="${_email%"${_email##*[![:space:]]}"}"
+            [[ -n "${_email}" ]] && admin_block+="      - ${_email}"$'\n'
+        done
+    fi
+
+    # telemetry.cloud.gcp_project_id line (empty string when PROJECT_ID unset).
+    local gcp_line=""
+    [[ -n "${PROJECT_ID:-}" ]] && gcp_line=$'    gcp_project_id: "'"${PROJECT_ID}"$'"\n'
+
+    cat <<SETTINGS_EOF
+schema_version: "1"
+default_runtime: ${default_runtime}
+server:
+  mode: production
+${admin_block}telemetry:
+  enabled: true
+  cloud:
+    enabled: true
+    provider: "gcp"
+    endpoint: "cloudtrace.googleapis.com:443"
+    protocol: "grpc"
+${gcp_line}    batch:
+      max_size: 256
+      timeout: "5s"
+  local:
+    enabled: true
+  filter:
+    events:
+      exclude:
+        - "agent.user.prompt"
+    attributes:
+      redact:
+        - "prompt"
+        - "user.email"
+        - "tool_output"
+        - "tool_input"
+      hash:
+        - "session_id"
+SETTINGS_EOF
+}
 
 # Wait for the instance to be reachable via SSH and for cloud-init to finish.
 # Call this before the first SSH-dependent step after provisioning.
@@ -78,9 +224,11 @@ wait_for_cloud_init() {
 
     while (( elapsed < max_wait )); do
         local result
+        # shellcheck disable=SC2086 # SSH_TUNNEL_FLAG is intentionally word-split (flag or empty)
         result=$(gcloud compute ssh "${INSTANCE_NAME}" \
             --project="${PROJECT_ID}" \
             --zone="${ZONE}" \
+            ${SSH_TUNNEL_FLAG} \
             --ssh-flag="-o ConnectTimeout=10" \
             --command "cloud-init status 2>/dev/null || echo 'status: unknown'" \
             2>/dev/null) || result="SSH_UNREACHABLE"
